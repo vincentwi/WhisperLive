@@ -12,7 +12,6 @@ import websocket
 import uuid
 import time
 
-
 def resample(file: str, sr: int = 16000):
     """
     # https://github.com/openai/whisper/blob/7858aa9c08d98f75575035ecd6481f462d66ca27/whisper/audio.py#L22
@@ -184,7 +183,8 @@ class Client:
         else:
             os.system("clear")
         for element in word_list:
-            print(element)
+            # print(element)
+            print("RECEIVED: ", element) 
 
     def on_error(self, ws, error):
         print(error)
@@ -368,7 +368,7 @@ class Client:
             for _ in range(0, int(self.rate / self.chunk * self.record_seconds)):
                 if not self.recording:
                     break
-                data = self.stream.read(self.chunk)
+                data = self.stream.read(self.chunk, exception_on_overflow=False)
                 self.frames += data
 
                 audio_array = Client.bytes_to_float_array(data)

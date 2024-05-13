@@ -14,6 +14,7 @@ import numpy as np
 import time
 from whisper_live.transcriber import WhisperModel
 from whisper_live.vad import VoiceActivityDetection
+from .MT_TTS import translate_new_words_with_context 
 
 
 class TranscriptionServer:
@@ -212,10 +213,11 @@ class ServeClient:
         self.data = b""
         self.frames = b""
         self.language = language if multilingual else "en"
+        self.target_language = "Spanish"
         self.task = task
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.transcriber = WhisperModel(
-            "small" if multilingual else "small.en", 
+            "small" if multilingual else "small",  #else small.en
             device=device,
             compute_type="int8" if device=="cpu" else "float16", 
             local_files_only=False,
@@ -233,11 +235,16 @@ class ServeClient:
         self.show_prev_out_thresh = 5   # if pause(no output from whisper) show previous output for 5 seconds
         self.add_pause_thresh = 3       # add a blank to segment list as a pause(no speech) for 3 seconds
         self.transcript = []
+        self.src_transcript = []
+        self.target_transcript = []
         self.send_last_n_segments = 10
 
         # text formatting
         self.wrapper = textwrap.TextWrapper(width=50)
         self.pick_previous_segments = 2
+        self.combined_previous_segments = ""
+        self.last_sent_segment = ""
+        self.previous_words = set()
 
         # threading
         self.websocket = websocket
@@ -452,6 +459,7 @@ class ServeClient:
             for i, s in enumerate(segments[:-1]):
                 text_ = s.text
                 self.text.append(text_)
+                # print(f">> ADDED \n Full Transcript: {self.text} \n Most Recent: {text_}")
                 start, end = self.timestamp_offset + s.start, self.timestamp_offset + min(duration, s.end)
                 self.transcript.append(
                     {
@@ -469,7 +477,6 @@ class ServeClient:
             'end': self.timestamp_offset + min(duration, segments[-1].end),
             'text': self.current_out
         }
-        
         # if same incomplete segment is seen multiple times then update the offset
         # and append the segment to the list
         if self.current_out.strip() == self.prev_out.strip() and self.current_out != '': 
@@ -498,6 +505,87 @@ class ServeClient:
         if offset is not None:
             self.timestamp_offset += offset
 
+        # print(f"\n Last Segment: {last_segment}")
+        
+        # src_new, target_new = translate_new_words_with_context(
+        #                                                     self.src_transcript, 
+        #                                                     self.target_transcript, 
+        #                                                     self.current_out, 
+        #                                                     self.language,
+        #                                                     self.target_language,
+        #                                                 ) #BLOCKING?!?!!
+        # if src_new != '42':
+        #     self.src_transcript.append(src_new)
+        # if target_new != '42':
+        #     self.target_transcript.append(target_new)
+        # print(f"SRC: {self.src_transcript} \nTRGT: {self.target_transcript}")
+
+
+        # t = threading.Thread(
+        #         target=translate_new_words_with_context,
+        #         args=(
+        #             self.text, 
+        #             self.target_transcript, 
+        #             self.current_out, 
+        #             self.language,
+        #             self.target_language,
+        #             self.output_queue
+        #         ),
+        #     )
+        # t.start()  
+
+        ########## SEND LAST COMPLETE SEGMENT ###########
+        # if len(self.text)>=1 and self.text[-1] != self.last_sent_segment:
+        #     self.last_sent_segment = self.text[-1]
+        #     print("Sending: ", self.last_sent_segment)
+        #     t = threading.Thread(
+        #                     target=transcribe_and_translate,
+        #                     args=(
+        #                         self.last_sent_segment,
+        #                     ),
+        #                 )
+        #     t.start() 
+
+        ######### OVERENGINEERED NONSENSE ############
+        # try: 
+        #     new_segment = last_segment['text']
+        #     tokenized_new_segment = tokenize(new_segment)
+
+        #     # if fuzz.ratio(new_part, last_sent_segment) > 90:
+        #     #     continue
+
+        #     change_index = find_point_of_change(new_segment, self.combined_previous_segments)
+        #     print(change_index)
+        #     # Validate change at a word level with fuzzy matching
+        #     if change_index > 0:
+        #         for i, word in enumerate(tokenized_new_segment):
+        #                 if not is_significant_change(word, self.previous_words) and i >= change_index:
+        #                     change_index = len(" ".join(tokenized_new_segment[:i]))
+        #                     break
+        #         print(change_index)
+
+        #     # Prepare and send new part to TTS
+        #     if change_index > 0 and change_index < len(new_segment):
+        #         new_part = new_segment[change_index:]
+        #         if new_part != self.last_sent_segment:
+        #             print("Send to TTS:", new_part)
+        #             self.last_sent_segment = new_part
+        #             t = threading.Thread(
+        #                     target=transcribe_and_translate,
+        #                     args=(
+        #                         new_part,
+        #                     ),
+        #                 )
+        #             t.start() 
+
+        #     # Update combined segments and word history
+        #     self.combined_previous_segments += ' ' + new_segment
+        #     self.combined_previous_segments = self.combined_previous_segments.strip()
+        #     self.previous_words.update(tokenized_new_segment)
+        # except:
+        #     print("oopsies")
+        #     pass
+            
         return last_segment
     
     def disconnect(self):
