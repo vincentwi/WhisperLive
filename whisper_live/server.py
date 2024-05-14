@@ -14,7 +14,10 @@ import numpy as np
 import time
 from whisper_live.transcriber import WhisperModel
 from whisper_live.vad import VoiceActivityDetection
-from .MT_TTS import translate_new_words_with_context 
+# from .MT_TTS import translate_new_words_with_context 
+from .MT import translate_new_words_with_context 
+import asyncio
+from fuzzywuzzy import fuzz
 
 
 class TranscriptionServer:
@@ -105,7 +108,8 @@ class TranscriptionServer:
             multilingual=options["multilingual"],
             language=options["language"],
             task=options["task"],
-            client_uid=options["uid"]
+            client_uid=options["uid"],
+            target_language=options["target_language"],
         )
 
         self.clients[websocket] = client
@@ -193,7 +197,8 @@ class ServeClient:
     SERVER_READY = "SERVER_READY"
     DISCONNECT = "DISCONNECT"
 
-    def __init__(self, websocket, task="transcribe", device=None, multilingual=False, language=None, client_uid=None):
+    def __init__(self, websocket, task="transcribe", device=None, multilingual=False, 
+                        language=None, client_uid=None, target_language=None,):
         """
         Initialize a ServeClient instance.
         The Whisper model is initialized based on the client's language and device availability.
@@ -213,7 +218,7 @@ class ServeClient:
         self.data = b""
         self.frames = b""
         self.language = language if multilingual else "en"
-        self.target_language = "Spanish"
+        self.target_language = target_language if target_language else "Spanish"
         self.task = task
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.transcriber = WhisperModel(
@@ -235,8 +240,8 @@ class ServeClient:
         self.show_prev_out_thresh = 5   # if pause(no output from whisper) show previous output for 5 seconds
         self.add_pause_thresh = 3       # add a blank to segment list as a pause(no speech) for 3 seconds
         self.transcript = []
-        self.src_transcript = []
-        self.target_transcript = []
+        self.src_transcript = ""
+        self.target_transcript = ""
         self.send_last_n_segments = 10
 
         # text formatting
@@ -248,8 +253,8 @@ class ServeClient:
 
         # threading
         self.websocket = websocket
-        self.trans_thread = threading.Thread(target=self.speech_to_text)
-        self.trans_thread.start()
+        # self.trans_thread = threading.Thread(target=self.speech_to_text)
+        # self.trans_thread.start()
         self.websocket.send(
             json.dumps(
                 {
@@ -258,7 +263,12 @@ class ServeClient:
                 }
             )
         )
-    
+        self.trans_thread = threading.Thread(target=self.start_async_loop)
+        self.trans_thread.start()
+
+    def start_async_loop(self):
+        asyncio.new_event_loop().run_until_complete(self.speech_to_text())
+            
     def fill_output(self, output):
         """
         Format the current incomplete transcription output by combining it with previous complete segments.
@@ -312,7 +322,7 @@ class ServeClient:
         else:
             self.frames_np = np.concatenate((self.frames_np, frame_np), axis=0)
 
-    def speech_to_text(self):
+    async def speech_to_text(self):
         """
         Process an audio stream in an infinite loop, continuously transcribing the speech.
 
@@ -385,7 +395,7 @@ class ServeClient:
 
                 if len(result):
                     self.t_start = None
-                    last_segment = self.update_segments(result, duration)
+                    last_segment = await self.update_segments(result, duration)
                     if len(self.transcript) < self.send_last_n_segments:
                         segments = self.transcript
                     else:
@@ -430,7 +440,8 @@ class ServeClient:
                 logging.error(f"[ERROR]: {e}")
                 time.sleep(0.01)
     
-    def update_segments(self, segments, duration):
+    
+    async def update_segments(self, segments, duration):
         """
         Processes the segments from whisper. Appends all the segments to the list
         except for the last segment assuming that it is incomplete.
@@ -444,56 +455,61 @@ class ServeClient:
         last processed segment, allowing it to be sent to the client for real-time updates.
 
         Args:
-            segments(dict) : dictionary of segments as returned by whisper
+            segments(dict): dictionary of segments as returned by whisper
             duration(float): duration of the current chunk
         
         Returns:
             dict or None: The last processed segment with its start time, end time, and transcribed text.
-                     Returns None if there are no valid segments to process.
+                          Returns None if there are no valid segments to process.
         """
         offset = None
         self.current_out = ''
         last_segment = None
-        # process complete segments
-        if len(segments) > 1:
-            for i, s in enumerate(segments[:-1]):
-                text_ = s.text
-                self.text.append(text_)
-                # print(f">> ADDED \n Full Transcript: {self.text} \n Most Recent: {text_}")
-                start, end = self.timestamp_offset + s.start, self.timestamp_offset + min(duration, s.end)
-                self.transcript.append(
-                    {
-                        'start': start,
-                        'end': end,
-                        'text': text_
-                    }
-                )
-                
-                offset = min(duration, s.end)
-
+        
+        # Process complete segments except the last one
+        for s in segments[:-1]:
+            text_ = s.text
+            self.text.append(text_)
+            start, end = self.timestamp_offset + s.start, self.timestamp_offset + min(duration, s.end)
+            self.transcript.append({'start': start, 'end': end, 'text': text_})
+            offset = min(duration, s.end)
+        
+        # Handle the last (possibly incomplete) segment
         self.current_out += segments[-1].text
         last_segment = {
             'start': self.timestamp_offset + segments[-1].start,
             'end': self.timestamp_offset + min(duration, segments[-1].end),
             'text': self.current_out
         }
-        # if same incomplete segment is seen multiple times then update the offset
-        # and append the segment to the list
-        if self.current_out.strip() == self.prev_out.strip() and self.current_out != '': 
+        print(self.same_output_threshold, self.current_out, self.prev_out)
+        # If the same incomplete segment is seen multiple times, consider it solid
+        if self.current_out.strip() == self.prev_out.strip() and self.current_out != '':
             self.same_output_threshold += 1
-        else: 
+        else:
             self.same_output_threshold = 0
-        
         if self.same_output_threshold > 5:
-            if not len(self.text) or self.text[-1].strip().lower()!=self.current_out.strip().lower():          
+            if not self.text or self.new_content(self.text, self.current_out): #check if its actually new info
                 self.text.append(self.current_out)
-                self.transcript.append(
-                    {
-                        'start': self.timestamp_offset,
-                        'end': self.timestamp_offset + duration,
-                        'text': self.current_out
-                    }
-                )
+                self.transcript.append({'start': self.timestamp_offset, 'end': self.timestamp_offset + duration, 'text': self.current_out})
+                
+                ##################################################################################################
+                # Call MTTS for final segment
+                SRCn, TGTn = await translate_new_words_with_context(self.src_transcript, 
+                                                        self.target_transcript, 
+                                                        self.current_out, 
+                                                        self.language,
+                                                        self.target_language)
+                self.src_transcript += " " + SRCn.strip()
+                self.target_transcript += " " + TGTn.strip()
+                print(f"SRC: {self.src_transcript} \n TGT: {self.target_transcript}")
+                # Send translation results to client
+                self.websocket.send(json.dumps({
+                    "uid": self.client_uid,
+                    "SRCn": SRCn,
+                    "TGTn": TGTn
+                }))
+                ##################################################################################################
+
             self.current_out = ''
             offset = duration
             self.same_output_threshold = 0
@@ -501,10 +517,28 @@ class ServeClient:
         else:
             self.prev_out = self.current_out
         
-        # update offset
+        # Update offset
         if offset is not None:
             self.timestamp_offset += offset
+        
+        return last_segment
 
+    def new_content(self, prev, current):
+        print("prev: ", prev)
+        if len(prev) < 1: return True
+        for p in prev:
+            if p.strip().lower() == current.strip().lower():
+                return False  # Exact match found, not new
+            if fuzz.ratio(current.lower(), p.lower()) > 85:
+                print(current.lower(), p.lower())
+                return False  # High similarity found, not new 
+            for w in ["Thank you very much.", "Thanks.", "Thank you.", 
+                        "Yeah, that's us", "Yes, that's cool."]:
+                if w.strip().lower() == current.strip().lower():
+                    return False  # Exact match found, not new
+                if fuzz.ratio(current.lower(), w.lower()) > 85:
+                    print(current.lower(), w.lower())
+        return True
         # print(f"\n Last Segment: {last_segment}")
         
         # src_new, target_new = translate_new_words_with_context(
@@ -586,7 +620,7 @@ class ServeClient:
         #     print("oopsies")
         #     pass
             
-        return last_segment
+        # return last_segment
     
     def disconnect(self):
         """
@@ -617,3 +651,5 @@ class ServeClient:
         logging.info("Cleaning up.")
         self.exit = True
         self.transcriber.destroy()
+        if self.trans_thread.is_alive():
+            self.trans_thread.join()

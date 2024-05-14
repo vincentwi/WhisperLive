@@ -11,6 +11,7 @@ import json
 import websocket
 import uuid
 import time
+import asyncio
 
 def resample(file: str, sr: int = 16000):
     """
@@ -49,7 +50,7 @@ class Client:
     INSTANCES = {}
 
     def __init__(
-        self, host=None, port=None, is_multilingual=False, lang=None, translate=False
+        self, host=None, port=None, is_multilingual=False, lang=None, translate=False, target_language=None
     ):
         """
         Initializes a Client instance for audio recording and streaming to a server.
@@ -72,7 +73,6 @@ class Client:
         self.record_seconds = 60000
         self.recording = False
         self.multilingual = False
-        self.language = None
         self.task = "transcribe"
         self.uid = str(uuid.uuid4())
         self.waiting = False
@@ -80,19 +80,21 @@ class Client:
         self.disconnect_if_no_response_for = 15
         self.multilingual = is_multilingual
         self.language = lang if is_multilingual else "en"
+        self.target_language = None
         if translate:
             self.task = "translate"
 
         self.timestamp_offset = 0.0
         self.audio_bytes = None
-        self.p = pyaudio.PyAudio()
-        self.stream = self.p.open(
-            format=self.format,
-            channels=self.channels,
-            rate=self.rate,
-            input=True,
-            frames_per_buffer=self.chunk,
-        )
+        self.on_translation_update = None 
+        # self.p = pyaudio.PyAudio()
+        # self.stream = self.p.open(
+        #     format=self.format,
+        #     channels=self.channels,
+        #     rate=self.rate,
+        #     input=True,
+        #     frames_per_buffer=self.chunk,
+        # )
 
         if host is not None and port is not None:
             socket_url = f"ws://{host}:{port}"
@@ -115,6 +117,10 @@ class Client:
         self.ws_thread = threading.Thread(target=self.client_socket.run_forever)
         self.ws_thread.setDaemon(True)
         self.ws_thread.start()
+
+        self.loop = asyncio.new_event_loop()
+        t = threading.Thread(target=self.loop.run_forever)
+        t.start()
 
         self.frames = b""
         print("[INFO]: * recording")
@@ -161,6 +167,11 @@ class Client:
             )
             return
 
+        if "SRCn" in message.keys() and "TGTn" in message.keys():
+            SRCn = message["SRCn"]
+            TGTn = message["TGTn"]
+            self.handle_translation_update(SRCn, TGTn)
+
         if "segments" not in message.keys():
             return
 
@@ -178,10 +189,10 @@ class Client:
         wrapper = textwrap.TextWrapper(width=60)
         word_list = wrapper.wrap(text="".join(text))
         # Print each line.
-        if os.name == "nt":
-            os.system("cls")
-        else:
-            os.system("clear")
+        # if os.name == "nt":
+        #     os.system("cls")
+        # else:
+        #     os.system("clear")
         for element in word_list:
             # print(element)
             print("RECEIVED: ", element) 
@@ -212,6 +223,7 @@ class Client:
                     "uid": self.uid,
                     "multilingual": self.multilingual,
                     "language": self.language,
+                    "target_language": self.target_language,
                     "task": self.task,
                 }
             )
@@ -436,6 +448,23 @@ class Client:
                 os.remove(in_file)
         wavfile.close()
 
+    def set_translation_update_callback(self, callback):
+        """
+        Registers a callback to be called with translation updates.
+        """
+        self.on_translation_update = callback
+
+    def handle_translation_update(self, SRCn, TGTn):
+        """
+        Called when new translation data is received. Executes the callback if available.
+        """
+        if self.on_translation_update:
+            print("callbacking")
+            # run_async(self.on_translation_update(SRCn, TGTn))   
+            asyncio.run_coroutine_threadsafe(self.on_translation_update(SRCn, TGTn), self.loop)
+
+
+
 
 class TranscriptionClient:
     """
@@ -461,8 +490,8 @@ class TranscriptionClient:
         transcription_client()
         ```
     """
-    def __init__(self, host, port, is_multilingual=False, lang=None, translate=False):
-        self.client = Client(host, port, is_multilingual, lang, translate)
+    def __init__(self, host, port, is_multilingual=False, lang=None, translate=False, target_language=None):
+        self.client = Client(host, port, is_multilingual, lang, translate, target_language)
 
     def __call__(self, audio=None):
         """
@@ -487,4 +516,21 @@ class TranscriptionClient:
             resampled_file = resample(audio)
             self.client.play_file(resampled_file)
         else:
-            self.client.record()
+            # self.client.record()
+            pass
+
+
+
+def run_async(func):
+    """
+    Helper function to run an asyncio function synchronously from a synchronous context.
+    """
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        # If the loop is already running (e.g., in a different async context), use run_coroutine_threadsafe
+        future = asyncio.run_coroutine_threadsafe(func, loop)
+        return future.result()
+    else:
+        # If no event loop is running, create and run a new one
+        return loop.run_until_complete(func)
+        
